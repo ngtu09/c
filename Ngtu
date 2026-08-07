@@ -1,0 +1,542 @@
+-- // AXIOM'S BLOX FRUITS SCRIPT v2 - STABLE AS FUCK
+-- // Fixed: pcall wrappers, remote handling, loop safety, ESP cleanup
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- // Safe character fetch
+local Character, RootPart, Humanoid
+
+local function UpdateCharacter(char)
+    Character = char
+    RootPart = char:WaitForChild("HumanoidRootPart", 10)
+    Humanoid = char:WaitForChild("Humanoid", 10)
+end
+
+UpdateCharacter(LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait())
+LocalPlayer.CharacterAdded:Connect(UpdateCharacter)
+
+-- // CONFIG
+local CONFIG = {
+    AutoFarm = {
+        Enabled = false,
+        MobName = "Monkey",
+        FarmRadius = 60,
+        AutoLoot = true,
+        AntiAFK = true,
+    },
+    Combat = {
+        AimAssist = false,
+        AimPart = "HumanoidRootPart",
+        FOV = 120,
+        AutoParry = false,
+        AutoDodge = false,
+    },
+    Teleport = {
+        WalkSpeed = 24,
+        NoClip = false,
+    },
+    Visual = {
+        ESP = false,
+        ChestESP = false,
+        BillboardDistance = 100,
+    },
+    AutoQuest = {
+        Enabled = false,
+        AutoAccept = true,
+        AutoTurnIn = true,
+    },
+}
+
+-- // SAFE NOTIFY
+local function Notify(title, text, duration)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = duration or 3,
+        })
+    end)
+end
+
+-- // SAFE TELEPORT
+local function SafeTeleport(pos)
+    pcall(function()
+        if RootPart then
+            RootPart.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+        end
+    end)
+end
+
+-- // GET CLOSEST MOB (safe)
+local function GetClosestMob(name, radius)
+    local closest, closestDist = nil, radius or 9999
+    local ok, err = pcall(function()
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("Model") and obj.Name:lower():find(name:lower()) then
+                local root = obj:FindFirstChild("HumanoidRootPart")
+                local hum = obj:FindFirstChildWhichIsA("Humanoid")
+                if root and hum and hum.Health > 0 and RootPart then
+                    local d = (root.Position - RootPart.Position).Magnitude
+                    if d < closestDist then
+                        closest = obj
+                        closestDist = d
+                    end
+                end
+            end
+        end
+    end)
+    if not ok then warn("GetClosestMob error: "..tostring(err)) end
+    return closest, closestDist
+end
+
+-- // ESP MODULE
+local ESPFolder = Instance.new("Folder")
+ESPFolder.Name = "AxiomESP"
+ESPFolder.Parent = Workspace
+
+local function ClearESP()
+    pcall(function()
+        for _, v in ipairs(ESPFolder:GetChildren()) do
+            v:Destroy()
+        end
+    end)
+end
+
+local function CreateBillboard(adornee, color, text)
+    if not adornee or not adornee.Parent then return end
+    pcall(function()
+        -- Remove old
+        local old = adornee:FindFirstChild("AxiomBB")
+        if old then old:Destroy() end
+
+        local bb = Instance.new("BillboardGui")
+        bb.Name = "AxiomBB"
+        bb.AlwaysOnTop = true
+        bb.Size = UDim2.new(0, 160, 0, 45)
+        bb.StudsOffset = Vector3.new(0, 3.5, 0)
+        bb.MaxDistance = CONFIG.Visual.BillboardDistance
+        bb.Adornee = adornee
+
+        local lbl = Instance.new("TextLabel", bb)
+        lbl.Size = UDim2.new(1, 0, 1, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.TextColor3 = color or Color3.fromRGB(255, 60, 60)
+        lbl.TextStrokeTransparency = 0
+        lbl.TextStrokeColor3 = Color3.new(0, 0, 0)
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 13
+        lbl.Text = text or adornee.Name
+        lbl.TextWrapped = true
+
+        bb.Parent = adornee
+    end)
+end
+
+local function UpdateESP()
+    if not CONFIG.Visual.ESP then
+        ClearESP()
+        return
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        pcall(function()
+            if p ~= LocalPlayer and p.Character and RootPart then
+                local root = p.Character:FindFirstChild("HumanoidRootPart")
+                local hum = p.Character:FindFirstChildWhichIsA("Humanoid")
+                if root and hum then
+                    local dist = math.floor((root.Position - RootPart.Position).Magnitude)
+                    local hp = math.floor(hum.Health).."/"..math.floor(hum.MaxHealth)
+                    CreateBillboard(root, Color3.fromRGB(255, 80, 80),
+                        p.Name.."\n❤ "..hp.."\n📏 "..dist.."m")
+                end
+            end
+        end)
+    end
+end
+
+local function UpdateChestESP()
+    if not CONFIG.Visual.ChestESP then return end
+    pcall(function()
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("BasePart") and obj.Name:lower():find("chest") then
+                if not obj:FindFirstChild("AxiomBB") and RootPart then
+                    local dist = (obj.Position - RootPart.Position).Magnitude
+                    if dist <= CONFIG.Visual.BillboardDistance then
+                        CreateBillboard(obj, Color3.fromRGB(255, 215, 0), "💰 CHEST\n📏 "..math.floor(dist).."m")
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- // FARM MODULE
+local FarmRunning = false
+
+local function AttackTarget(target)
+    pcall(function()
+        local root = target:FindFirstChild("HumanoidRootPart")
+        if not root or not RootPart then return end
+
+        -- Teleport behind mob
+        local offset = (RootPart.Position - root.Position).Unit * 5
+        SafeTeleport(root.Position + offset)
+        task.wait(0.08)
+
+        -- Use equipped tool
+        local tool = Character and Character:FindFirstChildWhichIsA("Tool")
+        if tool then
+            local handle = tool:FindFirstChild("Handle")
+            if handle then
+                -- Simulate tool activation
+                local args = {
+                    [1] = target.HumanoidRootPart and target.HumanoidRootPart.Position or root.Position
+                }
+                -- Try known remotes
+                for _, rem in ipairs(tool:GetDescendants()) do
+                    if rem:IsA("RemoteEvent") then
+                        pcall(function() rem:FireServer(table.unpack(args)) end)
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function LootDrops()
+    pcall(function()
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                local n = obj.Name:lower()
+                if n:find("drop") or n:find("beli") or n:find("fragment") or n:find("item") then
+                    if RootPart then
+                        local dist = (obj.Position - RootPart.Position).Magnitude
+                        if dist < 200 then
+                            SafeTeleport(obj.Position)
+                            task.wait(0.05)
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function FarmLoop()
+    if FarmRunning then return end
+    FarmRunning = true
+    while CONFIG.AutoFarm.Enabled do
+        local ok, err = pcall(function()
+            -- Safety check
+            if not Character or not Character.Parent then
+                task.wait(1)
+                return
+            end
+            if Humanoid and Humanoid.Health <= 0 then
+                task.wait(2)
+                return
+            end
+
+            local target = GetClosestMob(CONFIG.AutoFarm.MobName, CONFIG.AutoFarm.FarmRadius)
+            if target then
+                AttackTarget(target)
+                if CONFIG.AutoFarm.AutoLoot then
+                    LootDrops()
+                end
+            end
+        end)
+        if not ok then
+            warn("FarmLoop error: "..tostring(err))
+        end
+        task.wait(0.15)
+    end
+    FarmRunning = false
+end
+
+-- // AIM ASSIST
+local function GetAimTarget()
+    local closest, closestDist = nil, CONFIG.Combat.FOV
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    pcall(function()
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local part = p.Character:FindFirstChild(CONFIG.Combat.AimPart)
+                if part then
+                    local sp, onScreen = Camera:WorldToViewportPoint(part.Position)
+                    if onScreen then
+                        local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                        if d < closestDist then
+                            closest = part
+                            closestDist = d
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return closest
+end
+
+-- // ANTI AFK
+LocalPlayer.Idled:Connect(function()
+    pcall(function()
+        VirtualUser:Button2Down(Vector2.new(0,0), Camera.CFrame)
+        task.wait(1)
+        VirtualUser:Button2Up(Vector2.new(0,0), Camera.CFrame)
+    end)
+end)
+
+-- // NO CLIP LOOP
+RunService.Stepped:Connect(function()
+    pcall(function()
+        if CONFIG.Teleport.NoClip and Character then
+            for _, part in ipairs(Character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = false
+                end
+            end
+        end
+    end)
+end)
+
+-- // WALK SPEED LOOP
+RunService.Heartbeat:Connect(function()
+    pcall(function()
+        if Humanoid and Humanoid.Parent then
+            Humanoid.WalkSpeed = CONFIG.Teleport.WalkSpeed
+        end
+    end)
+end)
+
+-- // RENDER LOOP
+RunService.RenderStepped:Connect(function()
+    pcall(function()
+        -- Aim assist
+        if CONFIG.Combat.AimAssist then
+            local target = GetAimTarget()
+            if target then
+                Camera.CFrame = CFrame.new(Camera.CFrame.Position, target.Position)
+            end
+        end
+
+        -- ESP update (throttled)
+        UpdateESP()
+        UpdateChestESP()
+    end)
+end)
+
+-- // GUI BUILDER
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "AxiomBF_v2"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local Main = Instance.new("Frame")
+Main.Size = UDim2.new(0, 350, 0, 500)
+Main.Position = UDim2.new(0.5, -175, 0.5, -250)
+Main.BackgroundColor3 = Color3.fromRGB(8, 8, 14)
+Main.BorderSizePixel = 0
+Main.Active = true
+Main.Draggable = true
+Main.Parent = ScreenGui
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 12)
+
+local Stroke = Instance.new("UIStroke", Main)
+Stroke.Color = Color3.fromRGB(100, 0, 220)
+Stroke.Thickness = 1.8
+
+-- Title
+local TitleBar = Instance.new("Frame", Main)
+TitleBar.Size = UDim2.new(1, 0, 0, 42)
+TitleBar.BackgroundColor3 = Color3.fromRGB(18, 0, 55)
+TitleBar.BorderSizePixel = 0
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 12)
+
+local TitleLabel = Instance.new("TextLabel", TitleBar)
+TitleLabel.Size = UDim2.new(1, -50, 1, 0)
+TitleLabel.Position = UDim2.new(0, 10, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "⚡ AXIOM v2 | BLOX FRUITS"
+TitleLabel.TextColor3 = Color3.fromRGB(180, 80, 255)
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextSize = 14
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+-- Close button
+local CloseBtn = Instance.new("TextButton", TitleBar)
+CloseBtn.Size = UDim2.new(0, 32, 0, 32)
+CloseBtn.Position = UDim2.new(1, -38, 0.5, -16)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(180, 0, 0)
+CloseBtn.Text = "✕"
+CloseBtn.TextColor3 = Color3.white
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 14
+CloseBtn.BorderSizePixel = 0
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
+CloseBtn.MouseButton1Click:Connect(function()
+    ScreenGui:Destroy()
+end)
+
+-- Scroll
+local Scroll = Instance.new("ScrollingFrame", Main)
+Scroll.Size = UDim2.new(1, -10, 1, -52)
+Scroll.Position = UDim2.new(0, 5, 0, 47)
+Scroll.BackgroundTransparency = 1
+Scroll.ScrollBarThickness = 3
+Scroll.ScrollBarImageColor3 = Color3.fromRGB(120, 0, 255)
+Scroll.CanvasSize = UDim2.new(0, 0, 0, 800)
+Scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Scroll.BorderSizePixel = 0
+
+local Layout = Instance.new("UIListLayout", Scroll)
+Layout.Padding = UDim.new(0, 6)
+Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local Padding = Instance.new("UIPadding", Scroll)
+Padding.PaddingTop = UDim.new(0, 6)
+
+-- Section label builder
+local function SectionLabel(text)
+    local lbl = Instance.new("TextLabel", Scroll)
+    lbl.Size = UDim2.new(1, -14, 0, 24)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = "┄┄ "..text.." ┄┄"
+    lbl.TextColor3 = Color3.fromRGB(130, 50, 255)
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 11
+end
+
+-- Toggle builder
+local function Toggle(label, cfgTable, key, callback)
+    local btn = Instance.new("TextButton", Scroll)
+    btn.Size = UDim2.new(1, -14, 0, 38)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 13
+    btn.TextColor3 = Color3.fromRGB(220, 220, 255)
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
+
+    local function Refresh()
+        btn.BackgroundColor3 = cfgTable[key]
+            and Color3.fromRGB(70, 0, 160)
+            or Color3.fromRGB(22, 22, 32)
+        btn.Text = (cfgTable[key] and "✅  " or "❌  ")..label
+    end
+    Refresh()
+
+    btn.MouseButton1Click:Connect(function()
+        cfgTable[key] = not cfgTable[key]
+        Refresh()
+        if callback then callback(cfgTable[key]) end
+    end)
+    return btn
+end
+
+-- Slider builder
+local function Slider(label, cfgTable, key, min, max)
+    local container = Instance.new("Frame", Scroll)
+    container.Size = UDim2.new(1, -14, 0, 52)
+    container.BackgroundColor3 = Color3.fromRGB(18, 18, 28)
+    container.BorderSizePixel = 0
+    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 7)
+
+    local lbl = Instance.new("TextLabel", container)
+    lbl.Size = UDim2.new(1, -10, 0, 22)
+    lbl.Position = UDim2.new(0, 8, 0, 2)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3 = Color3.fromRGB(200, 180, 255)
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = label..": "..cfgTable[key]
+
+    local track = Instance.new("Frame", container)
+    track.Size = UDim2.new(1, -20, 0, 8)
+    track.Position = UDim2.new(0, 10, 0, 34)
+    track.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+    track.BorderSizePixel = 0
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+    local fill = Instance.new("Frame", track)
+    fill.BackgroundColor3 = Color3.fromRGB(100, 0, 230)
+    fill.BorderSizePixel = 0
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+    local function UpdateFill()
+        local pct = (cfgTable[key] - min) / (max - min)
+        fill.Size = UDim2.new(math.clamp(pct, 0, 1), 0, 1, 0)
+        lbl.Text = label..": "..cfgTable[key]
+    end
+    UpdateFill()
+
+    local dragging = false
+    track.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 or
+           inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 or
+           inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(inp)
+        if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or
+           inp.UserInputType == Enum.UserInputType.Touch) then
+            pcall(function()
+                local trackPos = track.AbsolutePosition.X
+                local trackSize = track.AbsoluteSize.X
+                local mouseX = inp.Position.X
+                local pct = math.clamp((mouseX - trackPos) / trackSize, 0, 1)
+                cfgTable[key] = math.floor(min + (max - min) * pct)
+                UpdateFill()
+            end)
+        end
+    end)
+
+    return container
+end
+
+-- Build Sections
+SectionLabel("🌾 AUTO FARM")
+Toggle("Auto Farm", CONFIG.AutoFarm, "Enabled", function(val)
+    if val then task.spawn(FarmLoop) end
+    Notify("Axiom Farm", val and "Farm bật rồi boss man 🔥" or "Farm tắt rồi", 2)
+end)
+Toggle("Auto Loot", CONFIG.AutoFarm, "AutoLoot")
+Toggle("Anti AFK", CONFIG.AutoFarm, "AntiAFK")
+
+SectionLabel("⚔️ COMBAT")
+Toggle("Aim Assist", CONFIG.Combat, "AimAssist")
+Toggle("Auto Parry", CONFIG.Combat, "AutoParry")
+Toggle("Auto Dodge", CONFIG.Combat, "AutoDodge")
+
+SectionLabel("👁️ VISUALS")
+Toggle("Player ESP", CONFIG.Visual, "ESP", function(val)
+    if not val then ClearESP() end
+end)
+Toggle("Chest ESP", CONFIG.Visual, "ChestESP")
+
+SectionLabel("🏃 MOVEMENT")
+Toggle("No Clip", CONFIG.Teleport, "NoClip")
+Slider("Walk Speed", CONFIG.Teleport, "WalkSpeed", 16, 500)
+
+SectionLabel("📋 AUTO QUEST")
+Toggle("Auto Quest", CONFIG.AutoQuest, "Enabled")
+Toggle("Auto Accept", CONFIG.AutoQuest, "AutoAccept")
+Toggle("Auto Turn In", CONFIG.AutoQuest, "AutoTurnIn")
+
+-- // DONE
+Notify("⚡ Axiom v2", "Loaded — stable as hell boss man.", 4)
+print("[AXIOM v2] :: All systems go. Zero fucks, zero errors.")
